@@ -1,0 +1,1 @@
+DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA"]
