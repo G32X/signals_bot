@@ -10,6 +10,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from .config import settings
 from .db import SessionLocal
 from .models import Signal, SignalStatus, Watchlist, Position, PositionStatus
+from .schemas import PortfolioRow
+from .data import last_price
 
 @dataclass
 class TelegramDB:
@@ -20,45 +22,6 @@ def _fmt_pct(x: float) -> str:
 
 def _now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-
-_http_session = requests.Session()
-_http_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Connection": "keep-alive",
-})
-
-def _latest_price(symbol: str) -> Optional[float]:
-    symbol = symbol.upper().strip()
-    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-    tries = [
-        {"range": "1d", "interval": "1m"},
-        {"range": "5d", "interval": "1h"},
-        {"range": "1y", "interval": "1d"},
-    ]
-    for p in tries:
-        try:
-            r = _http_session.get(url, params={
-                "range": p["range"], "interval": p["interval"],
-                "includePrePost": "false", "events": "div,splits",
-            }, timeout=20)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            result = (data.get("chart") or {}).get("result") or []
-            if not result:
-                continue
-            res = result[0]
-            ind = (res.get("indicators") or {}).get("quote") or []
-            if not ind:
-                continue
-            closes = (ind[0] or {}).get("close") or []
-            for val in reversed(closes):
-                if isinstance(val, (int, float)) and val == val:
-                    return float(val)
-        except Exception:
-            continue
-    return None
 
 class BotInstance:
     def __init__(self):
@@ -80,13 +43,18 @@ class BotInstance:
         self.app.add_handler(CommandHandler("pnl", self.pnl))
         self.app.add_handler(CommandHandler("watchlist", self.watchlist))
         self.app.add_handler(CommandHandler("positions", self.positions))
+        # Naujos patogios komandos:
+        self.app.add_handler(CommandHandler("portfolio", self.portfolio))
+        self.app.add_handler(CommandHandler("add", self.add_symbol))
+        self.app.add_handler(CommandHandler("remove", self.remove_symbol))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👋 Welcome to Tech Signals Bot!\n"
             "Commands: /help\n"
-            "/watchlist [show|add|remove] – manage watchlist\n"
-            "/positions – open long positions"
+            "/portfolio – open positions with P/L\n"
+            "/add <SYMBOL> – add symbol to watchlist\n"
+            "/remove <SYMBOL> – remove symbol from watchlist"
         )
 
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,7 +69,10 @@ class BotInstance:
             "/last <SYMBOL> [TF] – latest signal (1h|1d)\n"
             "/pnl [N] – unrealized P&L across last N signals (default 20)\n"
             "/watchlist [show|add|remove]\n"
-            "/positions – open long positions"
+            "/positions – open long positions\n"
+            "/portfolio – open positions with current P/L\n"
+            "/add <SYMBOL>\n"
+            "/remove <SYMBOL>"
         )
 
     async def subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,8 +153,7 @@ class BotInstance:
             evaluated = 0
             parts = []
             for s in signals:
-                # P/L nuo paskutinės kainos
-                price = _latest_price(s.symbol)
+                price = last_price(s.symbol)
                 if price is None or s.entry == 0:
                     continue
                 change = (price - s.entry) / s.entry if s.direction == "BUY" else (s.entry - price) / s.entry
@@ -257,6 +227,51 @@ class BotInstance:
         finally:
             db.close()
 
+    async def portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        db = SessionLocal()
+        try:
+            rows = db.query(Position).filter_by(status=PositionStatus.OPEN).all()
+            if not rows:
+                await update.message.reply_text("Portfolio is empty (no open positions)."); return
+            parts = ["💼 Portfolio (open):"]
+            for r in rows:
+                lp = last_price(r.symbol)
+                ch = ((lp - r.entry) / r.entry) if (lp and r.entry) else None
+                parts.append(f"• {r.symbol} {r.timeframe} @ {r.entry:.2f} → last {lp:.2f if lp else float('nan')}"
+                             + (f" | {(_fmt_pct(ch))}" if ch is not None else ""))
+            await update.message.reply_text("\n".join(parts))
+        finally:
+            db.close()
+
+    async def add_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /add <SYMBOL>"); return
+        sym = context.args[0].strip().upper()
+        db = SessionLocal()
+        try:
+            if not db.query(Watchlist).filter_by(symbol=sym).first():
+                db.add(Watchlist(symbol=sym)); db.commit()
+                await update.message.reply_text(f"✅ Added {sym} to watchlist.")
+            else:
+                await update.message.reply_text(f"ℹ️ {sym} already in watchlist.")
+        finally:
+            db.close()
+
+    async def remove_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /remove <SYMBOL>"); return
+        sym = context.args[0].strip().upper()
+        db = SessionLocal()
+        try:
+            row = db.query(Watchlist).filter_by(symbol=sym).first()
+            if row:
+                db.delete(row); db.commit()
+                await update.message.reply_text(f"🗑️ Removed {sym}.")
+            else:
+                await update.message.reply_text(f"ℹ️ {sym} not found.")
+        finally:
+            db.close()
+
     async def broadcast(self, text: str):
         for chat_id in list(self.db.subscribers):
             try:
@@ -276,6 +291,7 @@ class BotInstance:
 
 bot_instance = BotInstance()
 
-# ← paleidimas kaip atskiro worker'io
+# Paleidimas kaip modulio (worker) nenaudojamas Railway, nes veikia per FastAPI lifespan,
+# bet paliekam patogumui jei kada prireiktų:
 if __name__ == "__main__":
     asyncio.run(bot_instance.run_polling())
